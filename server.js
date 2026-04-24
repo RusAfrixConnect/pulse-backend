@@ -172,6 +172,131 @@ app.post('/messages', async (req, res) => {
   }
 });
 
+// ── MARKETPLACE ──────────────────────────────
+
+// Créer les tables marketplace
+const initMarketplace = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shops (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER,
+      name VARCHAR(200),
+      description TEXT,
+      type VARCHAR(50),
+      emoji VARCHAR(10),
+      lat FLOAT,
+      lng FLOAT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS products (
+      id SERIAL PRIMARY KEY,
+      shop_id INTEGER,
+      name VARCHAR(200),
+      description TEXT,
+      price FLOAT,
+      currency VARCHAR(10) DEFAULT 'ZND',
+      emoji VARCHAR(10),
+      available BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS orders (
+      id SERIAL PRIMARY KEY,
+      buyer_id INTEGER,
+      product_id INTEGER,
+      shop_id INTEGER,
+      price FLOAT,
+      currency VARCHAR(10),
+      status VARCHAR(50) DEFAULT 'pending',
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  console.log('✅ Marketplace initialisée');
+};
+
+initMarketplace();
+
+// Créer une boutique
+app.post('/shops', async (req, res) => {
+  const { userId, name, description, type, emoji, lat, lng } = req.body;
+  try {
+    const result = await pool.query(
+      'INSERT INTO shops (user_id, name, description, type, emoji, lat, lng) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
+      [userId, name, description, type, emoji, lat, lng]
+    );
+    res.json({ success: true, shop: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Récupérer toutes les boutiques
+app.get('/shops', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM shops ORDER BY created_at DESC');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Ajouter un produit
+app.post('/products', async (req, res) => {
+  const { shopId, name, description, price, currency, emoji } = req.body;
+  try {
+    const result = await pool.query(
+      'INSERT INTO products (shop_id, name, description, price, currency, emoji) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
+      [shopId, name, description, price, currency, emoji]
+    );
+    res.json({ success: true, product: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Récupérer les produits d'une boutique
+app.get('/products/:shopId', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM products WHERE shop_id = $1 AND available = TRUE',
+      [req.params.shopId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Créer une commande
+app.post('/orders', async (req, res) => {
+  const { buyerId, productId, shopId, price, currency } = req.body;
+  try {
+    const result = await pool.query(
+      'INSERT INTO orders (buyer_id, product_id, shop_id, price, currency) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+      [buyerId, productId, shopId, price, currency]
+    );
+    res.json({ success: true, order: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Récupérer les commandes d'une boutique
+app.get('/orders/:shopId', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM orders WHERE shop_id = $1 ORDER BY created_at DESC',
+      [req.params.shopId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── WEBSOCKET ────────────────────────────────
 io.on('connection', (socket) => {
   console.log('User connecté :', socket.id);
