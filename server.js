@@ -61,6 +61,12 @@ const initDB = async () => {
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
+  await pool.query(`
+  ALTER TABLE users 
+  ADD COLUMN IF NOT EXISTS birthdate VARCHAR(20),
+  ADD COLUMN IF NOT EXISTS country VARCHAR(100),
+  ADD COLUMN IF NOT EXISTS city VARCHAR(100);
+`).catch(() => {});
   console.log('✅ Base de données initialisée');
 };
 
