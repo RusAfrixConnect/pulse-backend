@@ -27,6 +27,9 @@ const initDB = async () => {
       name VARCHAR(100),
       email VARCHAR(100) UNIQUE,
       password VARCHAR(100),
+      birthdate VARCHAR(20),
+      country VARCHAR(100),
+      city VARCHAR(100),
       znd INTEGER DEFAULT 50,
       wallet_address VARCHAR(100),
       created_at TIMESTAMP DEFAULT NOW()
@@ -71,13 +74,13 @@ app.get('/', (req, res) => {
 
 // Inscription
 app.post('/register', async (req, res) => {
-  const { name, email, password } = req.body;
+  const { name, email, password, birthdate, country, city } = req.body;
   if (!name || !email || !password)
     return res.status(400).json({ error: 'Champs manquants' });
   try {
     const result = await pool.query(
-      'INSERT INTO users (name, email, password) VALUES ($1, $2, $3) RETURNING id, name, email, znd',
-      [name, email, password]
+      'INSERT INTO users (name, email, password, birthdate, country, city) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, name, email, znd',
+      [name, email, password, birthdate, country, city]
     );
     res.json({ success: true, user: result.rows[0] });
   } catch (err) {
