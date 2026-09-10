@@ -62,13 +62,71 @@ const initDB = async () => {
     );
   `);
   await pool.query(`
-  ALTER TABLE users 
+  ALTER TABLE users
   ADD COLUMN IF NOT EXISTS birthdate VARCHAR(20),
   ADD COLUMN IF NOT EXISTS country VARCHAR(100),
   ADD COLUMN IF NOT EXISTS city VARCHAR(100);
 `).catch(() => {});
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS pledges (
+      id SERIAL PRIMARY KEY,
+      pledge_id VARCHAR(64) UNIQUE NOT NULL,
+      borrower_address VARCHAR(100) NOT NULL,
+      collateral_type VARCHAR(20) NOT NULL,
+      collateral_value NUMERIC NOT NULL,
+      collateral_hash VARCHAR(200),
+      collateral_ref VARCHAR(200),
+      credit_amount NUMERIC NOT NULL,
+      duration_days INTEGER NOT NULL DEFAULT 30,
+      tx_hash VARCHAR(100),
+      due_date TIMESTAMP NOT NULL,
+      repaid_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_pledges_borrower ON pledges (borrower_address);`);
   console.log('✅ Base de données initialisée');
 };
+
+// ── VALT — GAGES / RÉPUTATION ────────────────
+// LTV (loan-to-value) : part de la valeur du bien accordée en crédit ZND.
+const LTV_RATIO = 0.7;
+
+function pledgeStatus(row) {
+  if (row.repaid_at) return 'REPAID';
+  if (new Date(row.due_date) < new Date()) return 'DEFAULTED';
+  return 'ACTIVE';
+}
+
+function pledgeToDetails(row) {
+  return {
+    pledgeId: row.pledge_id,
+    type: row.collateral_type,
+    model: row.collateral_ref,
+    collateralRef: row.collateral_ref,
+    collateralValue: parseFloat(row.collateral_value),
+    creditAmount: parseFloat(row.credit_amount),
+    durationDays: row.duration_days,
+    txHash: row.tx_hash,
+    dueDate: row.due_date,
+    status: pledgeStatus(row),
+    createdAt: row.created_at,
+  };
+}
+
+function computeReputation(rows) {
+  const totalPledges = rows.length;
+  const repaidPledges = rows.filter(r => pledgeStatus(r) === 'REPAID').length;
+  const defaultedPledges = rows.filter(r => pledgeStatus(r) === 'DEFAULTED').length;
+  const score = Math.max(0, Math.min(1000, 500 + repaidPledges * 50 - defaultedPledges * 100));
+  return {
+    score: String(score),
+    totalPledges: String(totalPledges),
+    repaidPledges: String(repaidPledges),
+    defaultedPledges: String(defaultedPledges),
+    maxCreditLimit: (score * 2).toFixed(1),
+  };
+}
 
 initDB();
 
@@ -178,6 +236,103 @@ app.post('/messages', async (req, res) => {
     res.json({ success: true, message });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── VALT — VALORISATION (formules provisoires, à remplacer par un vrai moteur de pricing) ──
+const CONDITION_MULTIPLIER = { new: 1, good: 0.8, fair: 0.6, poor: 0.4 };
+
+app.post('/api/valuate/physical', async (req, res) => {
+  const { model, condition } = req.body;
+  if (!model) return res.status(400).json({ success: false, error: 'Modèle manquant' });
+  const baseValue = 200; // placeholder : pas de catalogue de prix réel branché
+  const marketValue = Math.round(baseValue * (CONDITION_MULTIPLIER[condition] || 0.6));
+  res.json({ success: true, valuation: { marketValue } });
+});
+
+app.post('/api/valuate/skill', async (req, res) => {
+  const { hourlyRate, hours } = req.body;
+  if (!hourlyRate || !hours) return res.status(400).json({ success: false, error: 'Champs manquants' });
+  const totalValue = Math.round(parseFloat(hourlyRate) * parseFloat(hours));
+  res.json({ success: true, valuation: { totalValue } });
+});
+
+app.post('/api/valuate/subscription', async (req, res) => {
+  const { provider } = req.body;
+  if (!provider) return res.status(400).json({ success: false, error: 'Fournisseur manquant' });
+  const monthlyValue = 50; // placeholder : pas de barème par fournisseur branché
+  res.json({ success: true, valuation: { monthlyValue } });
+});
+
+// ── VALT — GAGES ──────────────────────────────
+app.post('/api/pledge/create', async (req, res) => {
+  const { borrowerAddress, collateralType, collateralValue, collateralHash, collateralRef, durationDays } = req.body;
+  if (!borrowerAddress || !collateralType || !collateralValue) {
+    return res.status(400).json({ success: false, error: 'Champs manquants' });
+  }
+  try {
+    const pledgeId = `pledge_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const days = parseInt(durationDays) || 30;
+    const creditAmount = parseFloat(collateralValue) * LTV_RATIO;
+    const dueDate = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+    // Pas de mint/transfer on-chain ici : le crédit est uniquement enregistré côté backend.
+    const txHash = `internal_${pledgeId}`;
+
+    await pool.query(
+      `INSERT INTO pledges
+        (pledge_id, borrower_address, collateral_type, collateral_value, collateral_hash, collateral_ref, credit_amount, duration_days, tx_hash, due_date)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [pledgeId, borrowerAddress, collateralType, collateralValue, collateralHash || null, collateralRef || null, creditAmount, days, txHash, dueDate]
+    );
+
+    res.json({ success: true, pledgeId, txHash, creditAmount, dueDate });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/pledge/:id', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM pledges WHERE pledge_id = $1', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'Gage introuvable' });
+    res.json({ success: true, pledge: pledgeToDetails(result.rows[0]) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/pledge/repay', async (req, res) => {
+  const { pledgeId } = req.body;
+  if (!pledgeId) return res.status(400).json({ success: false, error: 'pledgeId manquant' });
+  try {
+    const result = await pool.query(
+      `UPDATE pledges SET repaid_at = NOW() WHERE pledge_id = $1 AND repaid_at IS NULL RETURNING *`,
+      [pledgeId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'Gage introuvable ou déjà remboursé' });
+    res.json({ success: true, pledge: pledgeToDetails(result.rows[0]) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/user/:address/pledges', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM pledges WHERE borrower_address = $1 ORDER BY created_at DESC',
+      [req.params.address]
+    );
+    const pledgeDetails = {};
+    result.rows.forEach(row => { pledgeDetails[row.pledge_id] = pledgeToDetails(row); });
+
+    res.json({
+      success: true,
+      pledgeIds: result.rows.map(r => r.pledge_id),
+      pledgeDetails,
+      reputation: computeReputation(result.rows),
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
