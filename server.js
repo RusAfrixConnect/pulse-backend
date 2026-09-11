@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express    = require('express');
 const cors       = require('cors');
 const http       = require('http');
@@ -7,6 +8,8 @@ const QRCode     = require('qrcode');
 const bcrypt     = require('bcryptjs');
 const jwt        = require('jsonwebtoken');
 const crypto     = require('crypto');
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // En production, définis JWT_SECRET dans les variables d'env Render pour que les tokens
 // survivent aux redémarrages. Sans ça, un secret aléatoire est généré à chaque démarrage
@@ -42,6 +45,26 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
+
+async function getUserWalletAddress(userId) {
+  const result = await pool.query('SELECT wallet_address FROM users WHERE id = $1', [userId]);
+  return result.rows[0]?.wallet_address || null;
+}
+
+// Vérifie que `address` correspond bien au wallet_address lié au compte authentifié
+// (req.user.id). Renvoie une réponse d'erreur et retourne false si ce n'est pas le cas.
+async function requireOwnWallet(req, res, address) {
+  const ownAddress = await getUserWalletAddress(req.user.id);
+  if (!ownAddress) {
+    res.status(403).json({ success: false, error: 'Aucun wallet lié à ce compte, reconnecte-toi pour le synchroniser.' });
+    return false;
+  }
+  if (ownAddress.toLowerCase() !== String(address || '').toLowerCase()) {
+    res.status(403).json({ success: false, error: 'Cette adresse ne correspond pas à ton compte.' });
+    return false;
+  }
+  return true;
+}
 
 // Créer les tables si elles n'existent pas
 const initDB = async () => {
@@ -114,6 +137,16 @@ const initDB = async () => {
       currency VARCHAR(10) DEFAULT 'ZND',
       emoji VARCHAR(10),
       created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  // Empêche de collecter le même trésor plusieurs fois (le state client "found" est local
+  // et se réinitialise à chaque rechargement de l'app - sans ça, ZND infini).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS treasure_claims (
+      user_id INTEGER NOT NULL,
+      treasure_id INTEGER NOT NULL,
+      claimed_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY (user_id, treasure_id)
     );
   `);
   await pool.query(`
@@ -201,6 +234,8 @@ app.post('/register', async (req, res) => {
   if (!name || !email || !password)
     return res.status(400).json({ error: 'Champs manquants' });
   const normalizedEmail = String(email).trim().toLowerCase();
+  if (!EMAIL_REGEX.test(normalizedEmail))
+    return res.status(400).json({ error: 'Email invalide' });
   try {
     const passwordHash = await bcrypt.hash(password, 10);
     const result = await pool.query(
@@ -363,41 +398,132 @@ app.post('/products', requireAuth, async (req, res) => {
   }
 });
 
+// ── ÉCONOMIE ZND (server-authoritative) ────────
+// Remplace les écritures optimistes côté client (bug #13) : le serveur calcule et valide les
+// montants, fait foi sur users.znd. Le client n'envoie plus jamais un montant à créditer/débiter
+// directement, seulement des paramètres vérifiables (durée, id de trésor, raison).
+
+// Catalogue des trésors - doit rester synchronisé avec le tableau `treasures` de App.js.
+const TREASURE_CATALOG = { 1: 200, 2: 500, 3: 150, 4: 300 };
+// Coûts fixes : le montant vient toujours d'ici, jamais du corps de la requête.
+const SPEND_CATALOG = { territory_capture: 100 };
+// Montants où l'utilisateur choisit parmi une liste fermée (ex: pourboire live) - le serveur
+// n'accepte que ces valeurs précises, jamais un montant arbitraire envoyé par le client.
+const SPEND_ALLOWED_AMOUNTS = { live_tip: [10, 50, 100] };
+
+// Marche (App.js: +5 à 15 pas toutes les 2s pendant le tracking, znd = floor(steps/100))
+app.post('/economy/earn/walk', requireAuth, async (req, res) => {
+  const elapsedSeconds = Math.max(0, Math.min(parseInt(req.body.elapsedSeconds) || 0, 3600));
+  const maxSteps = Math.floor(elapsedSeconds / 2) * 15; // pire cas possible côté client
+  const earned = Math.floor(maxSteps / 100);
+  try {
+    const result = await pool.query('UPDATE users SET znd = znd + $1 WHERE id = $2 RETURNING znd', [earned, req.user.id]);
+    if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'Utilisateur introuvable' });
+    res.json({ success: true, earned, znd: result.rows[0].znd });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Trésors (montant fixe par trésor, une seule collecte par utilisateur - PRIMARY KEY (user_id, treasure_id))
+app.post('/economy/earn/treasure', requireAuth, async (req, res) => {
+  const treasureId = parseInt(req.body.treasureId);
+  const earned = TREASURE_CATALOG[treasureId];
+  if (!earned) return res.status(400).json({ success: false, error: 'Trésor inconnu' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('INSERT INTO treasure_claims (user_id, treasure_id) VALUES ($1, $2)', [req.user.id, treasureId]);
+    const result = await client.query('UPDATE users SET znd = znd + $1 WHERE id = $2 RETURNING znd', [earned, req.user.id]);
+    await client.query('COMMIT');
+    res.json({ success: true, earned, znd: result.rows[0].znd });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    if (err.code === '23505') return res.status(409).json({ success: false, error: 'Trésor déjà collecté' });
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Live streaming (App.js: +0 à 9 ZND toutes les 3s pendant le live)
+app.post('/economy/earn/live', requireAuth, async (req, res) => {
+  const elapsedSeconds = Math.max(0, Math.min(parseInt(req.body.elapsedSeconds) || 0, 3600));
+  const earned = Math.floor(elapsedSeconds / 3) * 9; // pire cas possible côté client
+  try {
+    const result = await pool.query('UPDATE users SET znd = znd + $1 WHERE id = $2 RETURNING znd', [earned, req.user.id]);
+    if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'Utilisateur introuvable' });
+    res.json({ success: true, earned, znd: result.rows[0].znd });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Dépenses (territoires, pourboires live, etc.) - le montant vient toujours d'un catalogue
+// serveur (fixe ou liste fermée), jamais directement du corps de la requête.
+app.post('/economy/spend', requireAuth, async (req, res) => {
+  const { reason, amount: requestedAmount } = req.body;
+  let amount = SPEND_CATALOG[reason];
+  if (!amount && SPEND_ALLOWED_AMOUNTS[reason]?.includes(parseFloat(requestedAmount))) {
+    amount = parseFloat(requestedAmount);
+  }
+  if (!amount) return res.status(400).json({ success: false, error: 'Raison ou montant invalide' });
+  try {
+    const result = await pool.query(
+      'UPDATE users SET znd = znd - $1 WHERE id = $2 AND znd >= $1 RETURNING znd',
+      [amount, req.user.id]
+    );
+    if (result.rows.length === 0) return res.status(400).json({ success: false, error: 'Solde ZND insuffisant' });
+    res.json({ success: true, spent: amount, znd: result.rows[0].znd });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ── VALT — VALORISATION (formules provisoires, à remplacer par un vrai moteur de pricing) ──
 const CONDITION_MULTIPLIER = { new: 1, good: 0.8, fair: 0.6, poor: 0.4 };
+
+// Source unique de la répartition crédit/frais/assurance (LTV_RATIO) - le client ne doit plus
+// dupliquer cette formule (cf. audit bug #18).
+function creditBreakdown(baseValue) {
+  const ltvValue = baseValue * LTV_RATIO;
+  return {
+    fee: Math.round(ltvValue * 0.025),
+    insurance: Math.round(ltvValue * 0.01),
+    netCredit: Math.round(ltvValue * 0.965),
+    confidence: 'medium',
+  };
+}
 
 app.post('/api/valuate/physical', requireAuth, async (req, res) => {
   const { model, condition } = req.body;
   if (!model) return res.status(400).json({ success: false, error: 'Modèle manquant' });
   const baseValue = 200; // placeholder : pas de catalogue de prix réel branché
   const marketValue = Math.round(baseValue * (CONDITION_MULTIPLIER[condition] || 0.6));
-  res.json({ success: true, valuation: { marketValue } });
+  res.json({ success: true, valuation: { marketValue, ...creditBreakdown(marketValue) } });
 });
 
 app.post('/api/valuate/skill', requireAuth, async (req, res) => {
   const { hourlyRate, hours } = req.body;
   if (!hourlyRate || !hours) return res.status(400).json({ success: false, error: 'Champs manquants' });
   const totalValue = Math.round(parseFloat(hourlyRate) * parseFloat(hours));
-  res.json({ success: true, valuation: { totalValue } });
+  res.json({ success: true, valuation: { marketValue: totalValue, totalValue, ...creditBreakdown(totalValue) } });
 });
 
 app.post('/api/valuate/subscription', requireAuth, async (req, res) => {
   const { provider } = req.body;
   if (!provider) return res.status(400).json({ success: false, error: 'Fournisseur manquant' });
   const monthlyValue = 50; // placeholder : pas de barème par fournisseur branché
-  res.json({ success: true, valuation: { monthlyValue } });
+  res.json({ success: true, valuation: { marketValue: monthlyValue, monthlyValue, ...creditBreakdown(monthlyValue) } });
 });
 
 // ── VALT — GAGES ──────────────────────────────
-// NOTE : requireAuth vérifie qu'un utilisateur Pulse valide est connecté. users.wallet_address
-// est désormais persisté (bug #3), mais ces routes ne vérifient PAS encore que
-// borrowerAddress/recipientAddress correspond au wallet_address de req.user.id — un utilisateur
-// légitime pourrait encore agir avec l'adresse d'un autre. Reste à faire pour clore le bug #6.
 app.post('/api/pledge/create', requireAuth, async (req, res) => {
   const { borrowerAddress, collateralType, collateralValue, collateralHash, collateralRef, durationDays } = req.body;
   if (!borrowerAddress || !collateralType || !collateralValue) {
     return res.status(400).json({ success: false, error: 'Champs manquants' });
   }
+  if (!(await requireOwnWallet(req, res, borrowerAddress))) return;
   try {
     const pledgeId = `pledge_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const days = parseInt(durationDays) || 30;
@@ -433,11 +559,15 @@ app.post('/api/pledge/repay', requireAuth, async (req, res) => {
   const { pledgeId } = req.body;
   if (!pledgeId) return res.status(400).json({ success: false, error: 'pledgeId manquant' });
   try {
+    const existing = await pool.query('SELECT borrower_address FROM pledges WHERE pledge_id = $1', [pledgeId]);
+    if (existing.rows.length === 0) return res.status(404).json({ success: false, error: 'Gage introuvable' });
+    if (!(await requireOwnWallet(req, res, existing.rows[0].borrower_address))) return;
+
     const result = await pool.query(
       `UPDATE pledges SET repaid_at = NOW() WHERE pledge_id = $1 AND repaid_at IS NULL RETURNING *`,
       [pledgeId]
     );
-    if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'Gage introuvable ou déjà remboursé' });
+    if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'Gage déjà remboursé' });
     res.json({ success: true, pledge: pledgeToDetails(result.rows[0]) });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -445,6 +575,7 @@ app.post('/api/pledge/repay', requireAuth, async (req, res) => {
 });
 
 app.get('/api/user/:address/pledges', requireAuth, async (req, res) => {
+  if (!(await requireOwnWallet(req, res, req.params.address))) return;
   try {
     const result = await pool.query(
       'SELECT * FROM pledges WHERE borrower_address = $1 ORDER BY created_at DESC',
@@ -470,6 +601,7 @@ app.post('/api/qr/generate', requireAuth, async (req, res) => {
   if (!pledgeId || !borrowerAddress || !amount) {
     return res.status(400).json({ success: false, error: 'Champs manquants' });
   }
+  if (!(await requireOwnWallet(req, res, borrowerAddress))) return;
   try {
     const pledgeResult = await pool.query('SELECT * FROM pledges WHERE pledge_id = $1', [pledgeId]);
     if (pledgeResult.rows.length === 0) {
@@ -520,6 +652,7 @@ app.post('/api/qr/pay', requireAuth, async (req, res) => {
   if (String(from).toLowerCase() === String(recipientAddress).toLowerCase()) {
     return res.status(400).json({ success: false, error: 'Impossible de te payer toi-même' });
   }
+  if (!(await requireOwnWallet(req, res, recipientAddress))) return;
 
   const client = await pool.connect();
   try {
@@ -568,6 +701,7 @@ app.post('/api/transfer/znd', requireAuth, async (req, res) => {
   if (String(from).toLowerCase() === String(to).toLowerCase()) {
     return res.status(400).json({ success: false, error: 'Impossible de te transférer à toi-même' });
   }
+  if (!(await requireOwnWallet(req, res, from))) return;
 
   const client = await pool.connect();
   try {
