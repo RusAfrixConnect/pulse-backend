@@ -8,8 +8,18 @@ const QRCode     = require('qrcode');
 const bcrypt     = require('bcryptjs');
 const jwt        = require('jsonwebtoken');
 const crypto     = require('crypto');
+const rateLimit  = require('express-rate-limit');
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// Limite le brute-force / spam de comptes sur /register et /login.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Trop de tentatives, réessaie dans quelques minutes.' },
+});
 
 // En production, définis JWT_SECRET dans les variables d'env Render pour que les tokens
 // survivent aux redémarrages. Sans ça, un secret aléatoire est généré à chaque démarrage
@@ -37,6 +47,9 @@ const io     = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 
+// Render fait proxy des requêtes : nécessaire pour que express-rate-limit (et req.ip en
+// général) voie la vraie IP du client via X-Forwarded-For, pas celle du proxy interne.
+app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json());
 
@@ -229,7 +242,7 @@ app.get('/', (req, res) => {
 });
 
 // Inscription
-app.post('/register', async (req, res) => {
+app.post('/register', authLimiter, async (req, res) => {
   const { name, email, password, birthdate, country, city } = req.body;
   if (!name || !email || !password)
     return res.status(400).json({ error: 'Champs manquants' });
@@ -253,7 +266,7 @@ app.post('/register', async (req, res) => {
 });
 
 // Connexion
-app.post('/login', async (req, res) => {
+app.post('/login', authLimiter, async (req, res) => {
   const { email, password } = req.body;
   const normalizedEmail = String(email || '').trim().toLowerCase();
   try {
