@@ -3,6 +3,7 @@ const cors       = require('cors');
 const http       = require('http');
 const { Server } = require('socket.io');
 const { Pool }   = require('pg');
+const QRCode     = require('qrcode');
 
 const app    = express();
 const server = http.createServer(app);
@@ -85,6 +86,16 @@ const initDB = async () => {
     );
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_pledges_borrower ON pledges (borrower_address);`);
+  // Solde ZND interne (hors-chaîne) : ce backend n'a pas de wallet chaud pour signer de vrais
+  // transferts BEP-20, donc /api/qr/pay et /api/transfer/znd déplacent de la valeur ici,
+  // séparément du solde on-chain réel et du crédit de gage (pledges.credit_amount).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS wallet_ledger (
+      address VARCHAR(100) PRIMARY KEY,
+      balance NUMERIC NOT NULL DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
   console.log('✅ Base de données initialisée');
 };
 
@@ -333,6 +344,145 @@ app.get('/api/user/:address/pledges', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── VALT — QR DE PAIEMENT ─────────────────────
+app.post('/api/qr/generate', async (req, res) => {
+  const { pledgeId, borrowerAddress, amount, expiryMinutes } = req.body;
+  if (!pledgeId || !borrowerAddress || !amount) {
+    return res.status(400).json({ success: false, error: 'Champs manquants' });
+  }
+  try {
+    const pledgeResult = await pool.query('SELECT * FROM pledges WHERE pledge_id = $1', [pledgeId]);
+    if (pledgeResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Gage introuvable' });
+    }
+    const pledge = pledgeResult.rows[0];
+    if (pledge.borrower_address.toLowerCase() !== String(borrowerAddress).toLowerCase()) {
+      return res.status(403).json({ success: false, error: 'Ce gage n\'appartient pas à cette adresse' });
+    }
+    if (pledgeStatus(pledge) !== 'ACTIVE') {
+      return res.status(400).json({ success: false, error: 'Ce gage n\'est plus actif' });
+    }
+    const requestedAmount = parseFloat(amount);
+    if (requestedAmount > parseFloat(pledge.credit_amount)) {
+      return res.status(400).json({ success: false, error: `Montant supérieur au crédit disponible (${pledge.credit_amount} ZND)` });
+    }
+
+    const expMinutes = parseInt(expiryMinutes) || 15;
+    const expiresAt = new Date(Date.now() + expMinutes * 60 * 1000);
+    const payload = {
+      v: 1,
+      pid: pledgeId,
+      amt: requestedAmount,
+      exp: Math.floor(expiresAt.getTime() / 1000),
+      from: borrowerAddress,
+    };
+
+    const dataURL = await QRCode.toDataURL(JSON.stringify(payload));
+
+    res.json({ success: true, qr: { dataURL, expiresAt: expiresAt.toISOString(), payload } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/qr/pay', async (req, res) => {
+  const { qrPayload, recipientAddress } = req.body;
+  if (!qrPayload || !recipientAddress) {
+    return res.status(400).json({ success: false, error: 'Champs manquants' });
+  }
+  const { pid, amt, exp, from } = qrPayload;
+  if (!pid || !amt || !exp || !from) {
+    return res.status(400).json({ success: false, error: 'QR invalide' });
+  }
+  if (Math.floor(Date.now() / 1000) > exp) {
+    return res.status(400).json({ success: false, error: 'QR expiré' });
+  }
+  if (String(from).toLowerCase() === String(recipientAddress).toLowerCase()) {
+    return res.status(400).json({ success: false, error: 'Impossible de te payer toi-même' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const pledgeResult = await client.query('SELECT * FROM pledges WHERE pledge_id = $1 FOR UPDATE', [pid]);
+    if (pledgeResult.rows.length === 0) throw Object.assign(new Error('Gage introuvable'), { status: 404 });
+    const pledge = pledgeResult.rows[0];
+    if (pledge.borrower_address.toLowerCase() !== String(from).toLowerCase()) {
+      throw Object.assign(new Error('QR invalide (gage/adresse incohérents)'), { status: 403 });
+    }
+    if (pledgeStatus(pledge) !== 'ACTIVE') {
+      throw Object.assign(new Error('Ce gage n\'est plus actif'), { status: 400 });
+    }
+    const amount = parseFloat(amt);
+    if (amount > parseFloat(pledge.credit_amount)) {
+      throw Object.assign(new Error('Crédit du gage insuffisant'), { status: 400 });
+    }
+
+    // Débit du crédit du gage, crédit du solde interne VALT du destinataire
+    await client.query('UPDATE pledges SET credit_amount = credit_amount - $1 WHERE pledge_id = $2', [amount, pid]);
+    await client.query(
+      `INSERT INTO wallet_ledger (address, balance) VALUES ($1, $2)
+       ON CONFLICT (address) DO UPDATE SET balance = wallet_ledger.balance + $2, updated_at = NOW()`,
+      [recipientAddress, amount]
+    );
+
+    const txHash = `internal_qrpay_${pid}_${Date.now()}`;
+    await client.query('COMMIT');
+
+    res.json({ success: true, txHash, amount, pledgeId: pid });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(err.status || 500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/transfer/znd', async (req, res) => {
+  const { from, to, amount } = req.body;
+  const amt = parseFloat(amount);
+  if (!from || !to || !amt || amt <= 0) {
+    return res.status(400).json({ success: false, error: 'Champs manquants ou montant invalide' });
+  }
+  if (String(from).toLowerCase() === String(to).toLowerCase()) {
+    return res.status(400).json({ success: false, error: 'Impossible de te transférer à toi-même' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const senderResult = await client.query(
+      `INSERT INTO wallet_ledger (address, balance) VALUES ($1, 0)
+       ON CONFLICT (address) DO UPDATE SET address = wallet_ledger.address
+       RETURNING *`,
+      [from]
+    );
+    const sender = senderResult.rows[0];
+    if (parseFloat(sender.balance) < amt) {
+      throw Object.assign(new Error('Solde ZND (interne VALT) insuffisant'), { status: 400 });
+    }
+
+    await client.query('UPDATE wallet_ledger SET balance = balance - $1, updated_at = NOW() WHERE address = $2', [amt, from]);
+    await client.query(
+      `INSERT INTO wallet_ledger (address, balance) VALUES ($1, $2)
+       ON CONFLICT (address) DO UPDATE SET balance = wallet_ledger.balance + $2, updated_at = NOW()`,
+      [to, amt]
+    );
+
+    const txHash = `internal_transfer_${Date.now()}`;
+    await client.query('COMMIT');
+
+    res.json({ success: true, txHash, amount: amt });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(err.status || 500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
   }
 });
 
