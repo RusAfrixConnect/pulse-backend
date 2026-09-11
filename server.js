@@ -162,6 +162,18 @@ const initDB = async () => {
       PRIMARY KEY (user_id, treasure_id)
     );
   `);
+  // Session de live server-authoritative (bug #C) : started_at est horodaté par le serveur,
+  // pas par le client, donc elapsedSeconds ne peut plus être falsifié. ended_at IS NULL
+  // empêche de terminer/créditer la même session deux fois (même garde que pledges.repaid_at).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS live_sessions (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      started_at TIMESTAMP DEFAULT NOW(),
+      ended_at TIMESTAMP,
+      earned NUMERIC
+    );
+  `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pledges (
       id SERIAL PRIMARY KEY,
@@ -459,16 +471,62 @@ app.post('/economy/earn/treasure', requireAuth, async (req, res) => {
   }
 });
 
-// Live streaming (App.js: +0 à 9 ZND toutes les 3s pendant le live)
-app.post('/economy/earn/live', requireAuth, async (req, res) => {
-  const elapsedSeconds = Math.max(0, Math.min(parseInt(req.body.elapsedSeconds) || 0, 3600));
-  const earned = Math.floor(elapsedSeconds / 3) * 9; // pire cas possible côté client
+// Live streaming (App.js: +0 à 9 ZND toutes les 3s pendant le live).
+// Server-authoritative sur le temps écoulé (bug #C) : l'ancienne route acceptait un
+// `elapsedSeconds` envoyé par le client et pouvait être rejouée à l'infini pour farmer du ZND
+// sans limite. Ici, le serveur horodate lui-même le début/fin de la session, et une session ne
+// peut être créditée qu'une seule fois (ended_at IS NULL fait office de verrou, comme
+// pledges.repaid_at).
+app.post('/economy/live/start', requireAuth, async (req, res) => {
   try {
-    const result = await pool.query('UPDATE users SET znd = znd + $1 WHERE id = $2 RETURNING znd', [earned, req.user.id]);
-    if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'Utilisateur introuvable' });
-    res.json({ success: true, earned, znd: result.rows[0].znd });
+    const existing = await pool.query(
+      'SELECT id, started_at FROM live_sessions WHERE user_id = $1 AND ended_at IS NULL',
+      [req.user.id]
+    );
+    if (existing.rows.length > 0) {
+      // Session déjà active (ex: reprise après une reconnexion) - la réutiliser plutôt que
+      // d'en ouvrir une autre en parallèle, qui permettrait de cumuler plusieurs gains simultanés.
+      return res.json({ success: true, sessionId: existing.rows[0].id, startedAt: existing.rows[0].started_at });
+    }
+    const result = await pool.query(
+      'INSERT INTO live_sessions (user_id) VALUES ($1) RETURNING id, started_at',
+      [req.user.id]
+    );
+    res.json({ success: true, sessionId: result.rows[0].id, startedAt: result.rows[0].started_at });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/economy/live/end', requireAuth, async (req, res) => {
+  const sessionId = parseInt(req.body.sessionId);
+  if (!sessionId) return res.status(400).json({ success: false, error: 'sessionId manquant' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const session = await client.query(
+      'SELECT * FROM live_sessions WHERE id = $1 AND user_id = $2 AND ended_at IS NULL FOR UPDATE',
+      [sessionId, req.user.id]
+    );
+    if (session.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, error: 'Session introuvable ou déjà terminée' });
+    }
+    const elapsedSeconds = Math.max(0, Math.min(
+      Math.floor((Date.now() - new Date(session.rows[0].started_at).getTime()) / 1000),
+      3600
+    ));
+    const earned = Math.floor(elapsedSeconds / 3) * 9; // pire cas possible côté client
+
+    await client.query('UPDATE live_sessions SET ended_at = NOW(), earned = $1 WHERE id = $2', [earned, sessionId]);
+    const result = await client.query('UPDATE users SET znd = znd + $1 WHERE id = $2 RETURNING znd', [earned, req.user.id]);
+    await client.query('COMMIT');
+    res.json({ success: true, earned, znd: result.rows[0].znd });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
   }
 });
 
