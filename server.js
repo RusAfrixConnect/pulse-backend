@@ -4,6 +4,29 @@ const http       = require('http');
 const { Server } = require('socket.io');
 const { Pool }   = require('pg');
 const QRCode     = require('qrcode');
+const bcrypt     = require('bcryptjs');
+const jwt        = require('jsonwebtoken');
+const crypto     = require('crypto');
+
+// En production, définis JWT_SECRET dans les variables d'env Render pour que les tokens
+// survivent aux redémarrages. Sans ça, un secret aléatoire est généré à chaque démarrage
+// (sûr par défaut, mais invalide tous les tokens émis avant le redémarrage).
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
+if (!process.env.JWT_SECRET) {
+  console.warn('⚠️  JWT_SECRET non défini : secret généré aléatoirement pour ce process (tokens invalidés au redémarrage). Configure JWT_SECRET sur Render.');
+}
+
+function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ success: false, error: 'Non authentifié' });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ success: false, error: 'Token invalide ou expiré' });
+  }
+}
 
 const app    = express();
 const server = http.createServer(app);
@@ -68,6 +91,31 @@ const initDB = async () => {
   ADD COLUMN IF NOT EXISTS country VARCHAR(100),
   ADD COLUMN IF NOT EXISTS city VARCHAR(100);
 `).catch(() => {});
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS shops (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL,
+      name VARCHAR(200) NOT NULL,
+      description TEXT,
+      type VARCHAR(50),
+      emoji VARCHAR(10),
+      lat FLOAT,
+      lng FLOAT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS products (
+      id SERIAL PRIMARY KEY,
+      shop_id INTEGER NOT NULL REFERENCES shops(id),
+      name VARCHAR(200) NOT NULL,
+      description TEXT,
+      price NUMERIC DEFAULT 0,
+      currency VARCHAR(10) DEFAULT 'ZND',
+      emoji VARCHAR(10),
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS pledges (
       id SERIAL PRIMARY KEY,
@@ -152,12 +200,16 @@ app.post('/register', async (req, res) => {
   const { name, email, password, birthdate, country, city } = req.body;
   if (!name || !email || !password)
     return res.status(400).json({ error: 'Champs manquants' });
+  const normalizedEmail = String(email).trim().toLowerCase();
   try {
+    const passwordHash = await bcrypt.hash(password, 10);
     const result = await pool.query(
-      'INSERT INTO users (name, email, password, birthdate, country, city) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, name, email, znd',
-      [name, email, password, birthdate, country, city]
+      'INSERT INTO users (name, email, password, birthdate, country, city) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, name, email, znd, wallet_address AS "walletAddress"',
+      [name, normalizedEmail, passwordHash, birthdate, country, city]
     );
-    res.json({ success: true, user: result.rows[0] });
+    const user = result.rows[0];
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ success: true, user, token });
   } catch (err) {
     if (err.code === '23505')
       return res.status(400).json({ error: 'Email déjà utilisé' });
@@ -168,21 +220,42 @@ app.post('/register', async (req, res) => {
 // Connexion
 app.post('/login', async (req, res) => {
   const { email, password } = req.body;
+  const normalizedEmail = String(email || '').trim().toLowerCase();
   try {
     const result = await pool.query(
-      'SELECT id, name, email, znd FROM users WHERE email = $1 AND password = $2',
-      [email, password]
+      'SELECT id, name, email, znd, password, wallet_address AS "walletAddress" FROM users WHERE email = $1',
+      [normalizedEmail]
     );
-    if (result.rows.length === 0)
+    const user = result.rows[0];
+    const match = user && await bcrypt.compare(password, user.password);
+    if (!match)
       return res.status(401).json({ error: 'Email ou mot de passe incorrect' });
-    res.json({ success: true, user: result.rows[0] });
+    delete user.password;
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ success: true, user, token });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// Lier/mettre à jour l'adresse wallet VALT de l'utilisateur connecté
+app.post('/users/wallet', requireAuth, async (req, res) => {
+  const { walletAddress } = req.body;
+  if (!walletAddress) return res.status(400).json({ success: false, error: 'walletAddress manquant' });
+  try {
+    const result = await pool.query(
+      'UPDATE users SET wallet_address = $1 WHERE id = $2 RETURNING id, name, email, znd, wallet_address AS "walletAddress"',
+      [walletAddress, req.user.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'Utilisateur introuvable' });
+    res.json({ success: true, user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // Récupérer tous les users
-app.get('/users', async (req, res) => {
+app.get('/users', requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
       'SELECT id, name, email, znd FROM users'
@@ -206,12 +279,12 @@ app.get('/events', async (req, res) => {
 });
 
 // Créer un event
-app.post('/events', async (req, res) => {
-  const { type, title, description, city, lat, lng, maxP, zndReward, userId } = req.body;
+app.post('/events', requireAuth, async (req, res) => {
+  const { type, title, description, city, lat, lng, maxP, zndReward } = req.body;
   try {
     const result = await pool.query(
       'INSERT INTO events (type, title, description, city, lat, lng, max_p, znd_reward, user_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
-      [type, title, description, city, lat, lng, maxP, zndReward, userId]
+      [type, title, description, city, lat, lng, maxP, zndReward, req.user.id]
     );
     const event = result.rows[0];
     io.emit('new_event', event);
@@ -222,7 +295,10 @@ app.post('/events', async (req, res) => {
 });
 
 // Récupérer les messages
-app.get('/messages/:userId', async (req, res) => {
+app.get('/messages/:userId', requireAuth, async (req, res) => {
+  if (String(req.user.id) !== String(req.params.userId)) {
+    return res.status(403).json({ error: 'Accès refusé' });
+  }
   try {
     const result = await pool.query(
       'SELECT * FROM messages WHERE from_user = $1 OR to_user = $1 ORDER BY created_at DESC',
@@ -235,12 +311,12 @@ app.get('/messages/:userId', async (req, res) => {
 });
 
 // Envoyer un message
-app.post('/messages', async (req, res) => {
-  const { from, to, text } = req.body;
+app.post('/messages', requireAuth, async (req, res) => {
+  const { to, text } = req.body;
   try {
     const result = await pool.query(
       'INSERT INTO messages (from_user, to_user, text) VALUES ($1, $2, $3) RETURNING *',
-      [from, to, text]
+      [req.user.id, to, text]
     );
     const message = result.rows[0];
     io.emit('new_message', message);
@@ -250,10 +326,47 @@ app.post('/messages', async (req, res) => {
   }
 });
 
+// Créer une boutique
+app.post('/shops', requireAuth, async (req, res) => {
+  const { name, description, type, emoji, lat, lng } = req.body;
+  if (!name) return res.status(400).json({ success: false, error: 'Nom manquant' });
+  try {
+    const result = await pool.query(
+      'INSERT INTO shops (user_id, name, description, type, emoji, lat, lng) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
+      [req.user.id, name, description, type, emoji, lat, lng]
+    );
+    res.json({ success: true, shop: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Ajouter un produit à une boutique
+app.post('/products', requireAuth, async (req, res) => {
+  const { shopId, name, description, price, currency, emoji } = req.body;
+  if (!shopId || !name) return res.status(400).json({ success: false, error: 'Champs manquants' });
+  try {
+    const shopResult = await pool.query('SELECT * FROM shops WHERE id = $1', [shopId]);
+    if (shopResult.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Boutique introuvable' });
+    }
+    if (shopResult.rows[0].user_id !== req.user.id) {
+      return res.status(403).json({ success: false, error: 'Cette boutique ne t\'appartient pas' });
+    }
+    const result = await pool.query(
+      'INSERT INTO products (shop_id, name, description, price, currency, emoji) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
+      [shopId, name, description, price || 0, currency || 'ZND', emoji]
+    );
+    res.json({ success: true, product: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ── VALT — VALORISATION (formules provisoires, à remplacer par un vrai moteur de pricing) ──
 const CONDITION_MULTIPLIER = { new: 1, good: 0.8, fair: 0.6, poor: 0.4 };
 
-app.post('/api/valuate/physical', async (req, res) => {
+app.post('/api/valuate/physical', requireAuth, async (req, res) => {
   const { model, condition } = req.body;
   if (!model) return res.status(400).json({ success: false, error: 'Modèle manquant' });
   const baseValue = 200; // placeholder : pas de catalogue de prix réel branché
@@ -261,14 +374,14 @@ app.post('/api/valuate/physical', async (req, res) => {
   res.json({ success: true, valuation: { marketValue } });
 });
 
-app.post('/api/valuate/skill', async (req, res) => {
+app.post('/api/valuate/skill', requireAuth, async (req, res) => {
   const { hourlyRate, hours } = req.body;
   if (!hourlyRate || !hours) return res.status(400).json({ success: false, error: 'Champs manquants' });
   const totalValue = Math.round(parseFloat(hourlyRate) * parseFloat(hours));
   res.json({ success: true, valuation: { totalValue } });
 });
 
-app.post('/api/valuate/subscription', async (req, res) => {
+app.post('/api/valuate/subscription', requireAuth, async (req, res) => {
   const { provider } = req.body;
   if (!provider) return res.status(400).json({ success: false, error: 'Fournisseur manquant' });
   const monthlyValue = 50; // placeholder : pas de barème par fournisseur branché
@@ -276,7 +389,11 @@ app.post('/api/valuate/subscription', async (req, res) => {
 });
 
 // ── VALT — GAGES ──────────────────────────────
-app.post('/api/pledge/create', async (req, res) => {
+// NOTE : requireAuth vérifie qu'un utilisateur Pulse valide est connecté. users.wallet_address
+// est désormais persisté (bug #3), mais ces routes ne vérifient PAS encore que
+// borrowerAddress/recipientAddress correspond au wallet_address de req.user.id — un utilisateur
+// légitime pourrait encore agir avec l'adresse d'un autre. Reste à faire pour clore le bug #6.
+app.post('/api/pledge/create', requireAuth, async (req, res) => {
   const { borrowerAddress, collateralType, collateralValue, collateralHash, collateralRef, durationDays } = req.body;
   if (!borrowerAddress || !collateralType || !collateralValue) {
     return res.status(400).json({ success: false, error: 'Champs manquants' });
@@ -302,7 +419,7 @@ app.post('/api/pledge/create', async (req, res) => {
   }
 });
 
-app.get('/api/pledge/:id', async (req, res) => {
+app.get('/api/pledge/:id', requireAuth, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM pledges WHERE pledge_id = $1', [req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'Gage introuvable' });
@@ -312,7 +429,7 @@ app.get('/api/pledge/:id', async (req, res) => {
   }
 });
 
-app.post('/api/pledge/repay', async (req, res) => {
+app.post('/api/pledge/repay', requireAuth, async (req, res) => {
   const { pledgeId } = req.body;
   if (!pledgeId) return res.status(400).json({ success: false, error: 'pledgeId manquant' });
   try {
@@ -327,7 +444,7 @@ app.post('/api/pledge/repay', async (req, res) => {
   }
 });
 
-app.get('/api/user/:address/pledges', async (req, res) => {
+app.get('/api/user/:address/pledges', requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
       'SELECT * FROM pledges WHERE borrower_address = $1 ORDER BY created_at DESC',
@@ -348,7 +465,7 @@ app.get('/api/user/:address/pledges', async (req, res) => {
 });
 
 // ── VALT — QR DE PAIEMENT ─────────────────────
-app.post('/api/qr/generate', async (req, res) => {
+app.post('/api/qr/generate', requireAuth, async (req, res) => {
   const { pledgeId, borrowerAddress, amount, expiryMinutes } = req.body;
   if (!pledgeId || !borrowerAddress || !amount) {
     return res.status(400).json({ success: false, error: 'Champs manquants' });
@@ -388,7 +505,7 @@ app.post('/api/qr/generate', async (req, res) => {
   }
 });
 
-app.post('/api/qr/pay', async (req, res) => {
+app.post('/api/qr/pay', requireAuth, async (req, res) => {
   const { qrPayload, recipientAddress } = req.body;
   if (!qrPayload || !recipientAddress) {
     return res.status(400).json({ success: false, error: 'Champs manquants' });
@@ -442,7 +559,7 @@ app.post('/api/qr/pay', async (req, res) => {
   }
 });
 
-app.post('/api/transfer/znd', async (req, res) => {
+app.post('/api/transfer/znd', requireAuth, async (req, res) => {
   const { from, to, amount } = req.body;
   const amt = parseFloat(amount);
   if (!from || !to || !amt || amt <= 0) {
