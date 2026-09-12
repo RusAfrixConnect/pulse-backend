@@ -79,6 +79,13 @@ async function requireOwnWallet(req, res, address) {
   return true;
 }
 
+// Aucune colonne "avatar" en base (pas de upload de photo) : un emoji déterministe par id
+// donne quand même un visuel stable et distinct par utilisateur dans les listes (amis,
+// annuaire, matching), sans faire porter au client une logique d'assignation d'avatar.
+const AVATAR_POOL = ['😀', '😎', '🙂', '🤓', '😊', '🧑', '👩', '👨', '🧔', '👱',
+  '👧', '🧑‍🦱', '🧑‍🦰', '🧑‍🦳', '🥷', '🦸', '🧙', '🧝', '🧑‍🎨', '🧑‍💻'];
+const avatarForUser = (id) => AVATAR_POOL[id % AVATAR_POOL.length];
+
 // Créer les tables si elles n'existent pas
 const initDB = async () => {
   await pool.query(`
@@ -135,6 +142,38 @@ const initDB = async () => {
   ADD COLUMN IF NOT EXISTS interests JSONB DEFAULT '[]'::jsonb,
   ADD COLUMN IF NOT EXISTS looking_for JSONB DEFAULT '[]'::jsonb;
 `).catch(() => {});
+  // Système d'amis : une seule ligne par paire d'utilisateurs, quel que soit le sens
+  // (l'index unique sur LEAST/GREATEST empêche à la fois les doublons dans le même sens
+  // et deux demandes opposées A→B + B→A en même temps - cf. POST /friends/request qui
+  // transforme une demande opposée déjà pendante en acceptation mutuelle plutôt qu'un conflit).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS relations (
+      id SERIAL PRIMARY KEY,
+      requester_id INTEGER NOT NULL REFERENCES users(id),
+      addressee_id INTEGER NOT NULL REFERENCES users(id),
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW(),
+      CHECK (requester_id <> addressee_id)
+    );
+  `);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_relations_pair
+    ON relations (LEAST(requester_id, addressee_id), GREATEST(requester_id, addressee_id));
+  `);
+  // Système de matching façon Tinder (indépendant des amis) : un like mutuel (deux lignes
+  // swiper/target inversées, liked=true) constitue un match - cf. POST /matching/swipe.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS swipes (
+      id SERIAL PRIMARY KEY,
+      swiper_id INTEGER NOT NULL REFERENCES users(id),
+      target_id INTEGER NOT NULL REFERENCES users(id),
+      liked BOOLEAN NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE (swiper_id, target_id),
+      CHECK (swiper_id <> target_id)
+    );
+  `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS shops (
       id SERIAL PRIMARY KEY,
@@ -384,11 +423,158 @@ app.post('/users/profile', requireAuth, async (req, res) => {
   }
 });
 
-// Récupérer tous les users
+// Champs de profil renvoyés partout où on liste des vrais utilisateurs (annuaire, amis,
+// matching) - jamais l'email (pas de raison qu'un autre utilisateur y ait accès) ni le
+// mot de passe. LIMIT 200 : garde-fou simple contre une réponse qui grossit sans borne,
+// pas une vraie pagination (à revoir si la base d'utilisateurs grossit significativement).
+const PUBLIC_PROFILE_FIELDS = `id, name, city, age, bio, interests, looking_for AS "lookingFor", znd`;
+
+// Annuaire des utilisateurs réels (hors soi-même) - alimente la liste d'amis à ajouter,
+// et servait de MOCK_USERS/MATCH_PROFILES côté client avant ce chantier.
 app.get('/users', requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT id, name, email, znd FROM users'
+      `SELECT ${PUBLIC_PROFILE_FIELDS} FROM users WHERE id != $1 ORDER BY created_at DESC LIMIT 200`,
+      [req.user.id]
+    );
+    res.json(result.rows.map(u => ({ ...u, avatar: avatarForUser(u.id) })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── AMIS (relations) ──────────────────────────
+
+// Envoie une demande d'ami. Si l'autre personne nous en avait déjà envoyé une (pendante),
+// la nôtre vaut acceptation mutuelle plutôt qu'une deuxième ligne (index unique sur la paire).
+app.post('/friends/request', requireAuth, async (req, res) => {
+  const targetId = parseInt(req.body.userId);
+  if (!targetId || targetId === req.user.id) {
+    return res.status(400).json({ success: false, error: 'Utilisateur invalide' });
+  }
+  const client = await pool.connect();
+  try {
+    const targetExists = await client.query('SELECT id FROM users WHERE id = $1', [targetId]);
+    if (targetExists.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Utilisateur introuvable' });
+    }
+    await client.query('BEGIN');
+    const existing = await client.query(
+      `SELECT * FROM relations
+       WHERE LEAST(requester_id, addressee_id) = LEAST($1, $2)
+         AND GREATEST(requester_id, addressee_id) = GREATEST($1, $2)
+       FOR UPDATE`,
+      [req.user.id, targetId]
+    );
+    if (existing.rows.length > 0) {
+      const rel = existing.rows[0];
+      if (rel.status === 'accepted' || rel.requester_id === req.user.id) {
+        await client.query('ROLLBACK');
+        return res.json({ success: true, status: rel.status, relation: rel });
+      }
+      const updated = await client.query(
+        `UPDATE relations SET status = 'accepted', updated_at = NOW() WHERE id = $1 RETURNING *`,
+        [rel.id]
+      );
+      await client.query('COMMIT');
+      return res.json({ success: true, status: 'accepted', relation: updated.rows[0] });
+    }
+    const inserted = await client.query(
+      `INSERT INTO relations (requester_id, addressee_id, status) VALUES ($1, $2, 'pending') RETURNING *`,
+      [req.user.id, targetId]
+    );
+    await client.query('COMMIT');
+    res.json({ success: true, status: 'pending', relation: inserted.rows[0] });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Accepte une demande reçue (seul le destinataire peut accepter).
+app.post('/friends/:relationId/accept', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE relations SET status = 'accepted', updated_at = NOW()
+       WHERE id = $1 AND addressee_id = $2 AND status = 'pending'
+       RETURNING *`,
+      [parseInt(req.params.relationId), req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Demande introuvable ou déjà traitée' });
+    }
+    res.json({ success: true, relation: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Supprime une relation : refuse une demande reçue, annule une demande envoyée, ou
+// met fin à une amitié acceptée - les trois sont juste "retirer la ligne" (aucune ne
+// nécessite de conserver un historique d'état).
+app.delete('/friends/:relationId', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `DELETE FROM relations WHERE id = $1 AND (requester_id = $2 OR addressee_id = $2) RETURNING id`,
+      [parseInt(req.params.relationId), req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Relation introuvable' });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Liste des amis (relations acceptées), avec le profil de l'autre personne.
+app.get('/friends', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT r.id AS "relationId", r.updated_at AS "since",
+              u.id, u.name, u.city, u.age, u.bio, u.interests,
+              u.looking_for AS "lookingFor", u.znd
+       FROM relations r
+       JOIN users u ON u.id = CASE WHEN r.requester_id = $1 THEN r.addressee_id ELSE r.requester_id END
+       WHERE (r.requester_id = $1 OR r.addressee_id = $1) AND r.status = 'accepted'
+       ORDER BY r.updated_at DESC`,
+      [req.user.id]
+    );
+    res.json(result.rows.map(u => ({ ...u, avatar: avatarForUser(u.id) })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Demandes d'amis reçues, en attente de réponse.
+app.get('/friends/requests', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT r.id AS "relationId", r.created_at AS "requestedAt",
+              u.id, u.name, u.city, u.age, u.bio, u.interests,
+              u.looking_for AS "lookingFor", u.znd
+       FROM relations r
+       JOIN users u ON u.id = r.requester_id
+       WHERE r.addressee_id = $1 AND r.status = 'pending'
+       ORDER BY r.created_at DESC`,
+      [req.user.id]
+    );
+    res.json(result.rows.map(u => ({ ...u, avatar: avatarForUser(u.id) })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Statut de relation avec chaque utilisateur en une seule requête (évite un appel par
+// utilisateur pour savoir si le bouton doit afficher "Ajouter" / "En attente" / "Amis").
+app.get('/friends/status', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id AS "relationId", requester_id AS "requesterId", addressee_id AS "addresseeId", status
+       FROM relations WHERE requester_id = $1 OR addressee_id = $1`,
+      [req.user.id]
     );
     res.json(result.rows);
   } catch (err) {
@@ -424,6 +610,74 @@ app.post('/events', requireAuth, async (req, res) => {
   }
 });
 
+// ── MATCHING (swipes) ─────────────────────────
+// Indépendant du système d'amis : un like mutuel (moi→lui ET lui→moi, liked=true) forme
+// un match. Le score de compatibilité affiché au swipe reste calculé côté client
+// (constants/matching.js, computeCompatibility) à partir du profil renvoyé ici - le
+// serveur ne fait que fournir les candidats et enregistrer les décisions.
+
+// Candidats à swiper : tout utilisateur réel pas encore swipé par moi (et pas moi-même).
+app.get('/matching/candidates', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT ${PUBLIC_PROFILE_FIELDS} FROM users
+       WHERE id != $1
+         AND id NOT IN (SELECT target_id FROM swipes WHERE swiper_id = $1)
+       ORDER BY created_at DESC LIMIT 200`,
+      [req.user.id]
+    );
+    res.json(result.rows.map(u => ({ ...u, avatar: avatarForUser(u.id) })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Enregistre un like/pass. Si la cible nous avait déjà liké, c'est un match mutuel.
+app.post('/matching/swipe', requireAuth, async (req, res) => {
+  const targetId = parseInt(req.body.targetId);
+  const liked = !!req.body.liked;
+  if (!targetId || targetId === req.user.id) {
+    return res.status(400).json({ success: false, error: 'Cible invalide' });
+  }
+  try {
+    await pool.query(
+      `INSERT INTO swipes (swiper_id, target_id, liked) VALUES ($1, $2, $3)
+       ON CONFLICT (swiper_id, target_id) DO UPDATE SET liked = $3`,
+      [req.user.id, targetId, liked]
+    );
+    let matched = false;
+    if (liked) {
+      const reciprocal = await pool.query(
+        'SELECT 1 FROM swipes WHERE swiper_id = $1 AND target_id = $2 AND liked = true',
+        [targetId, req.user.id]
+      );
+      matched = reciprocal.rows.length > 0;
+    }
+    res.json({ success: true, matched });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Liste des matchs mutuels, pour démarrer une conversation directement depuis là.
+app.get('/matching/matches', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT u.id, u.name, u.city, u.age, u.bio, u.interests,
+              u.looking_for AS "lookingFor", u.znd, s1.created_at AS "matchedAt"
+       FROM swipes s1
+       JOIN swipes s2 ON s2.swiper_id = s1.target_id AND s2.target_id = s1.swiper_id
+       JOIN users u ON u.id = s1.target_id
+       WHERE s1.swiper_id = $1 AND s1.liked = true AND s2.liked = true
+       ORDER BY s1.created_at DESC`,
+      [req.user.id]
+    );
+    res.json(result.rows.map(u => ({ ...u, avatar: avatarForUser(u.id) })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Récupérer les messages
 app.get('/messages/:userId', requireAuth, async (req, res) => {
   if (String(req.user.id) !== String(req.params.userId)) {
@@ -453,6 +707,70 @@ app.post('/messages', requireAuth, async (req, res) => {
     res.json({ success: true, message });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Liste des conversations (un contact = un dernier message + nombre de non-lus), pour
+// remplacer MOCK_MESSAGES par de vraies conversations entre utilisateurs réels.
+app.get('/conversations', requireAuth, async (req, res) => {
+  try {
+    const lastMessages = await pool.query(
+      `SELECT DISTINCT ON (other_user) other_user, text, created_at, from_user
+       FROM (
+         SELECT *, CASE WHEN from_user = $1 THEN to_user ELSE from_user END AS other_user
+         FROM messages WHERE from_user = $1 OR to_user = $1
+       ) sub
+       ORDER BY other_user, created_at DESC`,
+      [req.user.id]
+    );
+    if (lastMessages.rows.length === 0) return res.json([]);
+
+    const unread = await pool.query(
+      `SELECT from_user, COUNT(*)::int AS count
+       FROM messages WHERE to_user = $1 AND read = false
+       GROUP BY from_user`,
+      [req.user.id]
+    );
+    const unreadByUser = Object.fromEntries(unread.rows.map(r => [r.from_user, r.count]));
+
+    const otherIds = lastMessages.rows.map(r => r.other_user);
+    const profiles = await pool.query(
+      `SELECT ${PUBLIC_PROFILE_FIELDS} FROM users WHERE id = ANY($1::int[])`,
+      [otherIds]
+    );
+    const profileById = Object.fromEntries(profiles.rows.map(p => [p.id, p]));
+
+    const conversations = lastMessages.rows
+      .filter(m => profileById[m.other_user]) // ignore un contact supprimé entre-temps
+      .map(m => ({
+        ...profileById[m.other_user],
+        avatar: avatarForUser(m.other_user),
+        lastMessage: m.text,
+        lastMessageAt: m.created_at,
+        lastMessageMine: m.from_user === req.user.id,
+        unreadCount: unreadByUser[m.other_user] || 0,
+      }))
+      .sort((a, b) => new Date(b.lastMessageAt) - new Date(a.lastMessageAt));
+
+    res.json(conversations);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Marque comme lus tous les messages reçus d'un contact (appelé à l'ouverture du chat),
+// pour que le badge de non-lus dans /conversations reflète la réalité.
+app.post('/messages/read', requireAuth, async (req, res) => {
+  const otherUserId = parseInt(req.body.otherUserId);
+  if (!otherUserId) return res.status(400).json({ success: false, error: 'otherUserId manquant' });
+  try {
+    await pool.query(
+      'UPDATE messages SET read = true WHERE from_user = $1 AND to_user = $2 AND read = false',
+      [otherUserId, req.user.id]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
