@@ -199,6 +199,53 @@ const initDB = async () => {
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
+  // ── RÉSERVATIONS (commerces : restaurants, coiffeurs, médecins, etc.) ──
+  // Un commerce (businesses) affiche des créneaux (booking_slots) que les utilisateurs
+  // réservent (bookings). Indépendant de `shops` (marketplace produits) : un commerce à
+  // rendez-vous n'a pas de catalogue de produits, et un shop n'a pas de créneaux.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS businesses (
+      id SERIAL PRIMARY KEY,
+      owner_id INTEGER NOT NULL REFERENCES users(id),
+      name VARCHAR(200) NOT NULL,
+      type VARCHAR(50) NOT NULL,
+      description TEXT,
+      emoji VARCHAR(10) DEFAULT '📅',
+      lat FLOAT NOT NULL,
+      lng FLOAT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS booking_slots (
+      id SERIAL PRIMARY KEY,
+      business_id INTEGER NOT NULL REFERENCES businesses(id),
+      starts_at TIMESTAMP NOT NULL,
+      duration_minutes INTEGER NOT NULL DEFAULT 30,
+      price_znd INTEGER NOT NULL DEFAULT 0,
+      price_eur NUMERIC NOT NULL DEFAULT 0,
+      capacity INTEGER NOT NULL DEFAULT 1,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_slots_business ON booking_slots (business_id);`);
+  // status : confirmed | cancelled. Une seule ligne active par (slot, user) - empêche de
+  // réserver deux fois le même créneau par accident (double-tap réseau lent, etc.).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bookings (
+      id SERIAL PRIMARY KEY,
+      slot_id INTEGER NOT NULL REFERENCES booking_slots(id),
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      payment_method VARCHAR(10) NOT NULL,
+      amount NUMERIC NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'confirmed',
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_bookings_active_per_user
+    ON bookings (slot_id, user_id) WHERE status = 'confirmed';
+  `);
   // Empêche de collecter le même trésor plusieurs fois (le state client "found" est local
   // et se réinitialise à chaque rechargement de l'app - sans ça, ZND infini).
   await pool.query(`
@@ -808,6 +855,283 @@ app.post('/products', requireAuth, async (req, res) => {
     res.json({ success: true, product: result.rows[0] });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── RÉSERVATIONS (commerces : restaurants, coiffeurs, médecins, etc.) ──
+// Un commerce (businesses) affiche des créneaux (booking_slots) que les utilisateurs
+// réservent (bookings). Indépendant de `shops` (marketplace produits).
+const MAX_BUSINESS_TYPE_LENGTH = 50;
+
+// Créer un commerce (n'importe quel utilisateur peut en créer un, comme pour /shops).
+app.post('/businesses', requireAuth, async (req, res) => {
+  const { name, type, description, emoji, lat, lng } = req.body;
+  if (!name || !type || lat == null || lng == null) {
+    return res.status(400).json({ success: false, error: 'Champs manquants (nom, type, position)' });
+  }
+  if (String(type).length > MAX_BUSINESS_TYPE_LENGTH) {
+    return res.status(400).json({ success: false, error: 'Type de commerce trop long' });
+  }
+  try {
+    const result = await pool.query(
+      `INSERT INTO businesses (owner_id, name, type, description, emoji, lat, lng)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [req.user.id, name, type, description || null, emoji || '📅', parseFloat(lat), parseFloat(lng)]
+    );
+    res.json({ success: true, business: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Annuaire des commerces - alimente la carte (marqueur 📅) et la découverte.
+app.get('/businesses', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM businesses ORDER BY created_at DESC');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Mes commerces (pour la gestion : créneaux, réservations reçues).
+app.get('/businesses/mine', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM businesses WHERE owner_id = $1 ORDER BY created_at DESC', [req.user.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Crée un créneau (le commerce affiche ses disponibilités) - seul le propriétaire peut.
+app.post('/businesses/:id/slots', requireAuth, async (req, res) => {
+  const businessId = parseInt(req.params.id);
+  const { startsAt, durationMinutes, priceZnd, priceEur, capacity } = req.body;
+  if (!startsAt) return res.status(400).json({ success: false, error: 'Date/heure manquante' });
+  const startDate = new Date(startsAt);
+  if (Number.isNaN(startDate.getTime())) {
+    return res.status(400).json({ success: false, error: 'Date/heure invalide' });
+  }
+  try {
+    const biz = await pool.query('SELECT owner_id FROM businesses WHERE id = $1', [businessId]);
+    if (biz.rows.length === 0) return res.status(404).json({ success: false, error: 'Commerce introuvable' });
+    if (biz.rows[0].owner_id !== req.user.id) {
+      return res.status(403).json({ success: false, error: "Ce commerce ne t'appartient pas" });
+    }
+    const result = await pool.query(
+      `INSERT INTO booking_slots (business_id, starts_at, duration_minutes, price_znd, price_eur, capacity)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [businessId, startDate, parseInt(durationMinutes) || 30, parseInt(priceZnd) || 0,
+       parseFloat(priceEur) || 0, parseInt(capacity) || 1]
+    );
+    res.json({ success: true, slot: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Créneaux à venir d'un commerce avec places restantes (capacité - réservations actives) -
+// c'est la disponibilité affichée aux utilisateurs pour réserver.
+app.get('/businesses/:id/slots', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT s.*, s.capacity - COALESCE(b.active_count, 0) AS remaining
+       FROM booking_slots s
+       LEFT JOIN (
+         SELECT slot_id, COUNT(*)::int AS active_count FROM bookings
+         WHERE status = 'confirmed' GROUP BY slot_id
+       ) b ON b.slot_id = s.id
+       WHERE s.business_id = $1 AND s.starts_at > NOW()
+       ORDER BY s.starts_at ASC`,
+      [parseInt(req.params.id)]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Supprime un créneau sans réservation active (sinon il faudrait annuler/rembourser les
+// clients déjà réservés - non géré ici, on bloque plutôt que de le faire silencieusement).
+app.delete('/businesses/:businessId/slots/:slotId', requireAuth, async (req, res) => {
+  try {
+    const biz = await pool.query('SELECT owner_id FROM businesses WHERE id = $1', [parseInt(req.params.businessId)]);
+    if (biz.rows.length === 0) return res.status(404).json({ success: false, error: 'Commerce introuvable' });
+    if (biz.rows[0].owner_id !== req.user.id) {
+      return res.status(403).json({ success: false, error: "Ce commerce ne t'appartient pas" });
+    }
+    const activeBookings = await pool.query(
+      `SELECT 1 FROM bookings WHERE slot_id = $1 AND status = 'confirmed' LIMIT 1`,
+      [parseInt(req.params.slotId)]
+    );
+    if (activeBookings.rows.length > 0) {
+      return res.status(400).json({ success: false, error: 'Ce créneau a des réservations actives, impossible de le supprimer' });
+    }
+    const result = await pool.query(
+      'DELETE FROM booking_slots WHERE id = $1 AND business_id = $2 RETURNING id',
+      [parseInt(req.params.slotId), parseInt(req.params.businessId)]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'Créneau introuvable' });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Réserve un créneau. Paiement ZND : débit réel du solde de l'utilisateur, crédité au
+// propriétaire du commerce (boucle économique interne, comme le reste de l'app). Paiement
+// EUR : aucune passerelle de paiement fiat n'existe dans ce backend (le wallet VALT ne gère
+// que du ZND/BSC) - la réservation est enregistrée "à régler sur place", sans prélèvement
+// réel. Le client doit informer clairement l'utilisateur de cette différence.
+app.post('/slots/:id/book', requireAuth, async (req, res) => {
+  const slotId = parseInt(req.params.id);
+  const paymentMethod = req.body.paymentMethod === 'eur' ? 'eur' : 'znd';
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const slotResult = await client.query(
+      `SELECT s.*, b.owner_id, b.name AS business_name
+       FROM booking_slots s JOIN businesses b ON b.id = s.business_id
+       WHERE s.id = $1 FOR UPDATE`,
+      [slotId]
+    );
+    if (slotResult.rows.length === 0) {
+      throw Object.assign(new Error('Créneau introuvable'), { status: 404 });
+    }
+    const slot = slotResult.rows[0];
+    if (new Date(slot.starts_at) <= new Date()) {
+      throw Object.assign(new Error('Ce créneau est passé'), { status: 400 });
+    }
+    if (slot.owner_id === req.user.id) {
+      throw Object.assign(new Error('Impossible de réserver ton propre commerce'), { status: 400 });
+    }
+    const activeCount = await client.query(
+      `SELECT COUNT(*)::int AS count FROM bookings WHERE slot_id = $1 AND status = 'confirmed'`,
+      [slotId]
+    );
+    if (activeCount.rows[0].count >= slot.capacity) {
+      throw Object.assign(new Error('Ce créneau est complet'), { status: 400 });
+    }
+
+    const amount = paymentMethod === 'znd' ? slot.price_znd : slot.price_eur;
+    let newZnd;
+    if (paymentMethod === 'znd' && amount > 0) {
+      const payer = await client.query(
+        'UPDATE users SET znd = znd - $1 WHERE id = $2 AND znd >= $1 RETURNING znd',
+        [amount, req.user.id]
+      );
+      if (payer.rows.length === 0) {
+        throw Object.assign(new Error('Solde ZND insuffisant'), { status: 400 });
+      }
+      newZnd = payer.rows[0].znd;
+      await client.query('UPDATE users SET znd = znd + $1 WHERE id = $2', [amount, slot.owner_id]);
+    }
+
+    const booking = await client.query(
+      `INSERT INTO bookings (slot_id, user_id, payment_method, amount)
+       VALUES ($1,$2,$3,$4) RETURNING *`,
+      [slotId, req.user.id, paymentMethod, amount]
+    );
+
+    await client.query('COMMIT');
+    res.json({
+      success: true,
+      booking: booking.rows[0],
+      slot,
+      businessName: slot.business_name,
+      ...(newZnd !== undefined ? { znd: newZnd } : {}),
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    if (err.code === '23505') {
+      return res.status(409).json({ success: false, error: 'Tu as déjà réservé ce créneau' });
+    }
+    res.status(err.status || 500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Mes réservations (en tant que client), avec les infos du commerce/créneau.
+app.get('/bookings/mine', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT bk.id, bk.payment_method AS "paymentMethod", bk.amount, bk.status,
+              bk.created_at AS "bookedAt",
+              s.starts_at AS "startsAt", s.duration_minutes AS "durationMinutes",
+              b.id AS "businessId", b.name AS "businessName", b.type AS "businessType",
+              b.emoji AS "businessEmoji"
+       FROM bookings bk
+       JOIN booking_slots s ON s.id = bk.slot_id
+       JOIN businesses b ON b.id = s.business_id
+       WHERE bk.user_id = $1
+       ORDER BY s.starts_at DESC`,
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Réservations reçues par un de mes commerces (vue propriétaire).
+app.get('/businesses/:id/bookings', requireAuth, async (req, res) => {
+  try {
+    const biz = await pool.query('SELECT owner_id FROM businesses WHERE id = $1', [parseInt(req.params.id)]);
+    if (biz.rows.length === 0) return res.status(404).json({ error: 'Commerce introuvable' });
+    if (biz.rows[0].owner_id !== req.user.id) {
+      return res.status(403).json({ error: "Ce commerce ne t'appartient pas" });
+    }
+    const result = await pool.query(
+      `SELECT bk.id, bk.payment_method AS "paymentMethod", bk.amount, bk.status,
+              s.id AS "slotId", s.starts_at AS "startsAt", s.duration_minutes AS "durationMinutes",
+              u.id AS "userId", u.name AS "userName"
+       FROM bookings bk
+       JOIN booking_slots s ON s.id = bk.slot_id
+       JOIN users u ON u.id = bk.user_id
+       WHERE s.business_id = $1 AND bk.status = 'confirmed'
+       ORDER BY s.starts_at ASC`,
+      [parseInt(req.params.id)]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Annule ma réservation : libère la place et rembourse le ZND si c'était le moyen de
+// paiement (le paiement EUR n'a jamais été réellement prélevé, rien à rembourser).
+app.post('/bookings/:id/cancel', requireAuth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      `UPDATE bookings SET status = 'cancelled'
+       WHERE id = $1 AND user_id = $2 AND status = 'confirmed'
+       RETURNING *`,
+      [parseInt(req.params.id), req.user.id]
+    );
+    if (result.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, error: 'Réservation introuvable ou déjà annulée' });
+    }
+    const booking = result.rows[0];
+    if (booking.payment_method === 'znd' && parseFloat(booking.amount) > 0) {
+      await client.query('UPDATE users SET znd = znd + $1 WHERE id = $2', [booking.amount, req.user.id]);
+      const slot = await client.query('SELECT business_id FROM booking_slots WHERE id = $1', [booking.slot_id]);
+      const business = await client.query('SELECT owner_id FROM businesses WHERE id = $1', [slot.rows[0].business_id]);
+      await client.query('UPDATE users SET znd = GREATEST(znd - $1, 0) WHERE id = $2', [booking.amount, business.rows[0].owner_id]);
+    }
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
   }
 });
 
