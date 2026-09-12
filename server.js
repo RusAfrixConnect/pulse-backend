@@ -461,8 +461,8 @@ app.post('/friends/request', requireAuth, async (req, res) => {
     await client.query('BEGIN');
     const existing = await client.query(
       `SELECT * FROM relations
-       WHERE LEAST(requester_id, addressee_id) = LEAST($1, $2)
-         AND GREATEST(requester_id, addressee_id) = GREATEST($1, $2)
+       WHERE LEAST(requester_id, addressee_id) = LEAST($1::int, $2::int)
+         AND GREATEST(requester_id, addressee_id) = GREATEST($1::int, $2::int)
        FOR UPDATE`,
       [req.user.id, targetId]
     );
