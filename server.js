@@ -127,6 +127,14 @@ const initDB = async () => {
   ADD COLUMN IF NOT EXISTS country VARCHAR(100),
   ADD COLUMN IF NOT EXISTS city VARCHAR(100);
 `).catch(() => {});
+  // Profil de matching (IA Matching) : âge, bio, centres d'intérêt, type de relation recherchée.
+  await pool.query(`
+  ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS age INTEGER,
+  ADD COLUMN IF NOT EXISTS bio VARCHAR(150),
+  ADD COLUMN IF NOT EXISTS interests JSONB DEFAULT '[]'::jsonb,
+  ADD COLUMN IF NOT EXISTS looking_for JSONB DEFAULT '[]'::jsonb;
+`).catch(() => {});
   await pool.query(`
     CREATE TABLE IF NOT EXISTS shops (
       id SERIAL PRIMARY KEY,
@@ -264,7 +272,10 @@ app.post('/register', authLimiter, async (req, res) => {
   try {
     const passwordHash = await bcrypt.hash(password, 10);
     const result = await pool.query(
-      'INSERT INTO users (name, email, password, birthdate, country, city) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, name, email, znd, wallet_address AS "walletAddress"',
+      `INSERT INTO users (name, email, password, birthdate, country, city)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, name, email, znd, city, age, bio, interests, looking_for AS "lookingFor",
+                 wallet_address AS "walletAddress"`,
       [name, normalizedEmail, passwordHash, birthdate, country, city]
     );
     const user = result.rows[0];
@@ -283,7 +294,9 @@ app.post('/login', authLimiter, async (req, res) => {
   const normalizedEmail = String(email || '').trim().toLowerCase();
   try {
     const result = await pool.query(
-      'SELECT id, name, email, znd, password, wallet_address AS "walletAddress" FROM users WHERE email = $1',
+      `SELECT id, name, email, znd, password, city, age, bio, interests, looking_for AS "lookingFor",
+              wallet_address AS "walletAddress"
+       FROM users WHERE email = $1`,
       [normalizedEmail]
     );
     const user = result.rows[0];
@@ -306,6 +319,50 @@ app.post('/users/wallet', requireAuth, async (req, res) => {
     const result = await pool.query(
       'UPDATE users SET wallet_address = $1 WHERE id = $2 RETURNING id, name, email, znd, wallet_address AS "walletAddress"',
       [walletAddress, req.user.id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'Utilisateur introuvable' });
+    res.json({ success: true, user: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Taxonomie de matching - le serveur ne fait confiance qu'à ces valeurs, jamais à du texte
+// arbitraire envoyé par le client (évite de polluer la base avec des clés incohérentes).
+const INTEREST_KEYS = [
+  'sport', 'music', 'travel', 'reading', 'cooking', 'gaming', 'art', 'nature',
+  'fitness', 'photography', 'dancing', 'tech', 'animals', 'fashion', 'movies', 'party',
+];
+const LOOKING_FOR_KEYS = ['friendship', 'serious', 'casual'];
+
+// Profil de matching (IA Matching) : âge, ville, centres d'intérêt, type de relation recherchée.
+app.post('/users/profile', requireAuth, async (req, res) => {
+  const { age, bio, city, interests, lookingFor } = req.body;
+
+  if (age !== undefined && age !== null) {
+    const ageNum = parseInt(age);
+    if (!Number.isInteger(ageNum) || ageNum < 13 || ageNum > 120) {
+      return res.status(400).json({ success: false, error: 'Âge invalide' });
+    }
+  }
+  if (bio !== undefined && bio !== null && String(bio).length > 150) {
+    return res.status(400).json({ success: false, error: 'Bio trop longue (150 caractères max)' });
+  }
+  const cleanInterests = Array.isArray(interests)
+    ? interests.filter(i => INTEREST_KEYS.includes(i)).slice(0, 10)
+    : [];
+  const cleanLookingFor = Array.isArray(lookingFor)
+    ? lookingFor.filter(l => LOOKING_FOR_KEYS.includes(l)).slice(0, LOOKING_FOR_KEYS.length)
+    : [];
+
+  try {
+    const result = await pool.query(
+      `UPDATE users SET age = $1, bio = $2, city = $3, interests = $4, looking_for = $5
+       WHERE id = $6
+       RETURNING id, name, email, znd, city, age, bio, interests, looking_for AS "lookingFor",
+                 wallet_address AS "walletAddress"`,
+      [age ? parseInt(age) : null, bio != null ? String(bio).trim() : null, city || null,
+       JSON.stringify(cleanInterests), JSON.stringify(cleanLookingFor), req.user.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'Utilisateur introuvable' });
     res.json({ success: true, user: result.rows[0] });
