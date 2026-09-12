@@ -348,21 +348,34 @@ app.post('/users/profile', requireAuth, async (req, res) => {
   if (bio !== undefined && bio !== null && String(bio).length > 150) {
     return res.status(400).json({ success: false, error: 'Bio trop longue (150 caractères max)' });
   }
-  const cleanInterests = Array.isArray(interests)
-    ? interests.filter(i => INTEREST_KEYS.includes(i)).slice(0, 10)
-    : [];
-  const cleanLookingFor = Array.isArray(lookingFor)
-    ? lookingFor.filter(l => LOOKING_FOR_KEYS.includes(l)).slice(0, LOOKING_FOR_KEYS.length)
-    : [];
+  // Un champ absent de la requête (undefined) ne doit PAS écraser la valeur déjà en
+  // base : on passe NULL au paramètre correspondant et COALESCE(..., colonne) conserve
+  // l'ancienne valeur. Un champ explicitement fourni (y compris vide/[]) l'écrase bien -
+  // avant ce fix, `city || null` (et pareil pour age/bio/interests/lookingFor) mettait
+  // silencieusement tout champ omis à NULL, même quand l'appelant ne voulait modifier
+  // qu'un seul champ.
+  const ageParam = age !== undefined && age !== null ? parseInt(age) : null;
+  const bioParam = bio !== undefined ? String(bio ?? '').trim() : null;
+  const cityParam = city !== undefined ? (city || '') : null;
+  const interestsParam = interests !== undefined
+    ? JSON.stringify(Array.isArray(interests) ? interests.filter(i => INTEREST_KEYS.includes(i)).slice(0, 10) : [])
+    : null;
+  const lookingForParam = lookingFor !== undefined
+    ? JSON.stringify(Array.isArray(lookingFor) ? lookingFor.filter(l => LOOKING_FOR_KEYS.includes(l)).slice(0, LOOKING_FOR_KEYS.length) : [])
+    : null;
 
   try {
     const result = await pool.query(
-      `UPDATE users SET age = $1, bio = $2, city = $3, interests = $4, looking_for = $5
+      `UPDATE users SET
+         age = COALESCE($1, age),
+         bio = COALESCE($2, bio),
+         city = COALESCE($3, city),
+         interests = COALESCE($4::jsonb, interests),
+         looking_for = COALESCE($5::jsonb, looking_for)
        WHERE id = $6
        RETURNING id, name, email, znd, city, age, bio, interests, looking_for AS "lookingFor",
                  wallet_address AS "walletAddress"`,
-      [age ? parseInt(age) : null, bio != null ? String(bio).trim() : null, city || null,
-       JSON.stringify(cleanInterests), JSON.stringify(cleanLookingFor), req.user.id]
+      [ageParam, bioParam, cityParam, interestsParam, lookingForParam, req.user.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ success: false, error: 'Utilisateur introuvable' });
     res.json({ success: true, user: result.rows[0] });
